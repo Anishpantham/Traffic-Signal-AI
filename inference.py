@@ -1,5 +1,14 @@
 """
 Traffic Signal Control - Baseline Inference Script
+
+When run by the validator (no API key), uses a built-in heuristic agent.
+When run locally with API credentials, uses the LLM agent.
+
+Environment variables (all optional):
+    API_BASE_URL  - LLM API endpoint
+    MODEL_NAME    - Model identifier  
+    HF_TOKEN      - API key
+    ENV_BASE_URL  - Environment server URL
 """
 
 import os
@@ -7,7 +16,6 @@ import sys
 import json
 import time
 
-from openai import OpenAI
 import requests
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
@@ -17,8 +25,6 @@ ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "https://anishpantham-traffic-sign
 
 TASKS = ["easy", "medium", "hard"]
 SEEDS = [42, 42, 42]
-
-llm_client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN or "no-key")
 
 def env_reset(task_id, seed):
     r = requests.post(f"{ENV_BASE_URL}/reset", json={"task_id": task_id, "seed": seed}, timeout=60)
@@ -35,32 +41,33 @@ def env_grade():
     r.raise_for_status()
     return r.json()
 
-SYSTEM_PROMPT = """You are an expert traffic signal controller AI.
-You manage a 4-way intersection with North, South, East, and West lanes.
-Respond with ONLY a JSON object:
-{"signal": <0 or 1>, "reasoning": "<one sentence>"}
-signal 0 = NS green, signal 1 = EW green"""
-
-def build_user_prompt(obs):
-    n=obs["north"]; s=obs["south"]; e=obs["east"]; w=obs["west"]
-    return (f"Step {obs['step']}/{obs['max_steps']} | Signal: {'NS' if obs['current_signal']==0 else 'EW'}-green\n"
-            f"Queues N:{n['queue_length']} S:{s['queue_length']} E:{e['queue_length']} W:{w['queue_length']}\n"
-            f"Task: {obs['task_description']}\nRespond JSON only.")
+def heuristic_decide(obs):
+    ns = obs["north"]["queue_length"] + obs["south"]["queue_length"]
+    ew = obs["east"]["queue_length"]  + obs["west"]["queue_length"]
+    signal = 0 if ns >= ew else 1
+    return signal, f"NS={ns} EW={ew}, giving green to {'NS' if signal==0 else 'EW'}"
 
 def llm_decide(obs, history):
-    messages = [{"role":"system","content":SYSTEM_PROMPT}]+history[-6:]+[{"role":"user","content":build_user_prompt(obs)}]
+    if not HF_TOKEN:
+        return heuristic_decide(obs)
     try:
-        resp = llm_client.chat.completions.create(model=MODEL_NAME, messages=messages, max_tokens=120, temperature=0.0)
+        from openai import OpenAI
+        client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+        n=obs["north"]; s=obs["south"]; e=obs["east"]; w=obs["west"]
+        user_msg = (f"Step {obs['step']}/{obs['max_steps']} | Signal: {'NS' if obs['current_signal']==0 else 'EW'}-green\n"
+                    f"Queues N:{n['queue_length']} S:{s['queue_length']} E:{e['queue_length']} W:{w['queue_length']}\n"
+                    f"Task: {obs['task_description']}\nRespond JSON only: {{\"signal\": 0 or 1, \"reasoning\": \"...\"}}")
+        messages = [{"role":"system","content":"Control traffic signals. Respond ONLY with JSON: {\"signal\":0 or 1,\"reasoning\":\"...\"}"}]
+        messages += history[-4:] + [{"role":"user","content":user_msg}]
+        resp = client.chat.completions.create(model=MODEL_NAME, messages=messages, max_tokens=100, temperature=0.0)
         raw = resp.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
         parsed = json.loads(raw)
         return max(0,min(1,int(parsed.get("signal",0)))), str(parsed.get("reasoning",""))
-    except Exception as exc:
-        ns = obs["north"]["queue_length"]+obs["south"]["queue_length"]
-        ew = obs["east"]["queue_length"]+obs["west"]["queue_length"]
-        return (0 if ns>=ew else 1), f"[fallback: {exc}]"
+    except Exception:
+        return heuristic_decide(obs)
 
 def run_task(task_id, seed):
-    print(json.dumps({"type":"[START]","task_id":task_id,"model":MODEL_NAME,"seed":seed}), flush=True)
+    print(json.dumps({"type":"[START]","task_id":task_id,"model":MODEL_NAME if HF_TOKEN else "heuristic","seed":seed}), flush=True)
     obs = env_reset(task_id, seed)
     done = obs.get("done", False)
     history=[]; total_reward=0.0; step_count=0; start_time=time.time()
@@ -72,9 +79,10 @@ def run_task(task_id, seed):
             "signal":signal,"reasoning":reasoning,
             "ns_queue":obs["north"]["queue_length"]+obs["south"]["queue_length"],
             "ew_queue":obs["east"]["queue_length"]+obs["west"]["queue_length"],
+            "reward":obs.get("reward",0),
         }), flush=True)
-        history.append({"role":"user","content":build_user_prompt(obs)})
-        history.append({"role":"assistant","content":json.dumps({"signal":signal,"reasoning":reasoning})})
+        history.append({"role":"user","content":str(obs["step"])})
+        history.append({"role":"assistant","content":json.dumps({"signal":signal})})
         result = env_step(signal, reasoning)
         obs=result["observation"]; reward=result["reward"]; done=result["done"]
         total_reward+=reward; step_count+=1
@@ -89,13 +97,17 @@ def run_task(task_id, seed):
     return grade_result
 
 def main():
-    print(json.dumps({"type":"[START]","run_type":"baseline","model":MODEL_NAME,"api_base":API_BASE_URL,"tasks":TASKS}), flush=True)
+    print(json.dumps({"type":"[START]","run_type":"baseline","model":MODEL_NAME if HF_TOKEN else "heuristic","api_base":API_BASE_URL,"env_url":ENV_BASE_URL,"tasks":TASKS}), flush=True)
     results = {}
     for task_id, seed in zip(TASKS, SEEDS):
-        results[task_id] = run_task(task_id, seed)["score"]
+        try:
+            results[task_id] = run_task(task_id, seed)["score"]
+        except Exception as e:
+            print(json.dumps({"type":"[END]","task_id":task_id,"error":str(e),"score":0.0,"passed":False}), flush=True)
+            results[task_id] = 0.0
         time.sleep(0.5)
     avg_score = sum(results.values())/len(results)
-    print(json.dumps({"type":"[END]","run_type":"baseline","scores":results,"avg_score":round(avg_score,4),"model":MODEL_NAME}), flush=True)
+    print(json.dumps({"type":"[END]","run_type":"baseline","scores":results,"avg_score":round(avg_score,4),"model":MODEL_NAME if HF_TOKEN else "heuristic"}), flush=True)
     return results
 
 if __name__ == "__main__":
