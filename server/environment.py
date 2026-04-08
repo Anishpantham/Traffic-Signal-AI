@@ -1,13 +1,5 @@
 """
 Traffic Signal Control - Server Environment Logic
-
-Three tasks of increasing difficulty, each with a programmatic grader
-that scores agent performance from 0.0 to 1.0.
-
-Tasks:
-  easy   - single intersection, low traffic, 100 steps
-  medium - single intersection, high traffic, 200 steps, unbalanced flow
-  hard   - single intersection, surge traffic, 300 steps, asymmetric
 """
 
 import uuid
@@ -16,10 +8,6 @@ from typing import Dict, Tuple
 
 from models import TrafficAction, TrafficObservation, TrafficState, LaneState
 
-
-# ============================================================
-# TASK DEFINITIONS
-# ============================================================
 
 TASKS: Dict[str, dict] = {
     "easy": {
@@ -33,7 +21,7 @@ TASKS: Dict[str, dict] = {
         "min_green_time": 3,
         "yellow_time": 2,
         "target_avg_wait": 5.0,
-        "success_threshold": 0.70,   # score >= 0.70 = pass
+        "success_threshold": 0.70,
     },
     "medium": {
         "description": (
@@ -42,7 +30,7 @@ TASKS: Dict[str, dict] = {
         ),
         "max_steps": 200,
         "spawn_prob": 0.4,
-        "spawn_prob_ew": 0.2,         # EW lanes less busy
+        "spawn_prob_ew": 0.2,
         "lane_capacity": 10,
         "min_green_time": 4,
         "yellow_time": 2,
@@ -52,7 +40,7 @@ TASKS: Dict[str, dict] = {
     "hard": {
         "description": (
             "Rush-hour surge: all lanes very busy, capacity constrained to 8. "
-            "Achieve total throughput ≥ 180 vehicles in 300 steps without "
+            "Achieve total throughput >= 180 vehicles in 300 steps without "
             "any lane queue exceeding 7 for more than 10 consecutive steps."
         ),
         "max_steps": 300,
@@ -67,10 +55,6 @@ TASKS: Dict[str, dict] = {
     },
 }
 
-
-# ============================================================
-# VEHICLE & LANE (standalone, no matplotlib dependency)
-# ============================================================
 
 class _Vehicle:
     def __init__(self):
@@ -92,7 +76,6 @@ class _Lane:
             self.vehicles.append(_Vehicle())
 
     def update(self, is_green: bool) -> bool:
-        """Returns True if a vehicle crossed this step."""
         self.spawn()
         crossed = False
         if is_green and self.vehicles:
@@ -118,61 +101,43 @@ class _Lane:
         return self.queue_length / self.capacity
 
 
-# ============================================================
-# CORE ENVIRONMENT
-# ============================================================
-
 class TrafficEnvironment:
-    """
-    Single-intersection traffic signal environment.
-    Implements reset() / step() / state property.
-    """
 
     def __init__(self):
-        self._episode_id  = str(uuid.uuid4())
-        self._task_id     = "easy"
-        self._cfg         = TASKS["easy"]
-        self._step_count  = 0
-        self._total_reward = 0.0
-        self._done        = False
-
-        # Signal state
-        self._signal          = 0   # 0=NS, 1=EW
-        self._time_on_signal  = 0
-        self._in_yellow       = False
-        self._yellow_counter  = 0
-
-        # Lanes
-        self._lanes: Dict[str, _Lane] = {}
-
-        # Metrics for graders
-        self._total_throughput   = 0
-        self._overflow_streak: Dict[str, int] = {"N": 0, "S": 0, "E": 0, "W": 0}
-        self._max_overflow_steps = 0   # worst lane's consecutive overflow
-        self._cumulative_wait    = 0.0
-        self._step_rewards: list = []
-
-    # ----------------------------------------------------------
-    def reset(self, task_id: str = "easy") -> TrafficObservation:
-        self._task_id     = task_id
-        self._cfg         = TASKS[task_id]
-        self._episode_id  = str(uuid.uuid4())
-        self._step_count  = 0
-        self._total_reward = 0.0
-        self._done        = False
-
+        self._episode_id     = str(uuid.uuid4())
+        self._task_id        = "easy"
+        self._cfg            = TASKS["easy"]
+        self._step_count     = 0
+        self._total_reward   = 0.0
+        self._done           = False
         self._signal         = 0
         self._time_on_signal = 0
         self._in_yellow      = False
         self._yellow_counter = 0
+        self._lanes: Dict[str, _Lane] = {}
+        self._total_throughput   = 0
+        self._overflow_streak: Dict[str, int] = {"N": 0, "S": 0, "E": 0, "W": 0}
+        self._max_overflow_steps = 0
+        self._cumulative_wait    = 0.0
+        self._step_rewards: list = []
 
+    def reset(self, task_id: str = "easy") -> TrafficObservation:
+        self._task_id        = task_id
+        self._cfg            = TASKS[task_id]
+        self._episode_id     = str(uuid.uuid4())
+        self._step_count     = 0
+        self._total_reward   = 0.0
+        self._done           = False
+        self._signal         = 0
+        self._time_on_signal = 0
+        self._in_yellow      = False
+        self._yellow_counter = 0
         self._total_throughput   = 0
         self._overflow_streak    = {"N": 0, "S": 0, "E": 0, "W": 0}
         self._max_overflow_steps = 0
         self._cumulative_wait    = 0.0
         self._step_rewards       = []
 
-        # Build lanes
         sp    = self._cfg["spawn_prob"]
         sp_ew = self._cfg.get("spawn_prob_ew", sp)
         cap   = self._cfg["lane_capacity"]
@@ -186,33 +151,28 @@ class TrafficEnvironment:
 
         return self._observe(reward=None, done=False)
 
-    # ----------------------------------------------------------
     def step(self, action: TrafficAction) -> Tuple[TrafficObservation, float, bool]:
         if self._done:
             raise RuntimeError("Episode is done — call reset() first.")
 
-        # --- Apply signal (with safety constraints) ---
         requested = action.signal
         safe      = self._safe_signal(requested)
 
         if not self._in_yellow:
             if safe != self._signal:
-                # Start yellow phase
                 self._in_yellow      = True
                 self._yellow_counter = 0
                 self._signal         = safe
                 self._time_on_signal = 0
 
-        # --- Tick yellow phase ---
         if self._in_yellow:
             self._yellow_counter += 1
             if self._yellow_counter >= self._cfg["yellow_time"]:
                 self._in_yellow = False
-            green_lanes = []   # no one moves during yellow
+            green_lanes = []
         else:
             green_lanes = ["N", "S"] if self._signal == 0 else ["E", "W"]
 
-        # --- Update lanes ---
         step_throughput = 0
         for name, lane in self._lanes.items():
             crossed = lane.update(is_green=(name in green_lanes))
@@ -221,7 +181,6 @@ class TrafficEnvironment:
 
         self._total_throughput += step_throughput
 
-        # Update overflow streaks
         for name, lane in self._lanes.items():
             overflow_q = self._cfg.get("overflow_queue", 7)
             if lane.queue_length > overflow_q:
@@ -232,17 +191,14 @@ class TrafficEnvironment:
             else:
                 self._overflow_streak[name] = 0
 
-        # Cumulative wait
         total_wait = sum(l.avg_wait for l in self._lanes.values())
         self._cumulative_wait += total_wait
 
-        # Reward
         raw_reward  = self._compute_raw_reward(step_throughput, total_wait)
         norm_reward = self._normalise_reward(raw_reward)
         self._total_reward += norm_reward
         self._step_rewards.append(norm_reward)
 
-        # Advance time
         self._step_count     += 1
         self._time_on_signal += 1
         done = self._step_count >= self._cfg["max_steps"]
@@ -251,7 +207,6 @@ class TrafficEnvironment:
         obs = self._observe(reward=norm_reward, done=done)
         return obs, norm_reward, done
 
-    # ----------------------------------------------------------
     @property
     def state(self) -> TrafficState:
         return TrafficState(
@@ -262,15 +217,9 @@ class TrafficEnvironment:
             is_done      = self._done,
         )
 
-    # ----------------------------------------------------------
     def grade(self) -> float:
-        """
-        Produce a final score in [0.0, 1.0] for the completed episode.
-        Called by the grader endpoint after the episode ends.
-        """
         if self._step_count == 0:
-            return 0.0
-
+            return 0.001
         if self._task_id == "easy":
             return self._grade_easy()
         elif self._task_id == "medium":
@@ -278,58 +227,31 @@ class TrafficEnvironment:
         else:
             return self._grade_hard()
 
-    # ----------------------------------------------------------
-    # GRADERS
-    # ----------------------------------------------------------
-
     def _grade_easy(self) -> float:
-        """
-        Score based on keeping average wait time low.
-        avg_wait / step across episode vs target_avg_wait.
-        """
         avg_wait_per_step = self._cumulative_wait / max(1, self._step_count) / 4
         target = self._cfg["target_avg_wait"]
-
-        # Linear score: 1.0 if avg_wait=0, 0.0 if avg_wait >= 2*target
-        score = max(0.0, 1.0 - avg_wait_per_step / (2 * target))
-        return round(score, 4)
+        score = 1.0 - avg_wait_per_step / (2 * target)
+        return round(min(0.999, max(0.001, score)), 4)
 
     def _grade_medium(self) -> float:
-        """
-        Score on (a) low average wait and (b) no lane ever exceeding capacity.
-        """
         avg_wait_per_step = self._cumulative_wait / max(1, self._step_count) / 4
         target = self._cfg["target_avg_wait"]
-        wait_score = max(0.0, 1.0 - avg_wait_per_step / (2 * target))
-
-        # Penalty for overflow (max overflow streak normalised to max_steps)
-        overflow_penalty = min(1.0, self._max_overflow_steps / self._cfg["max_steps"])
+        wait_score = 1.0 - avg_wait_per_step / (2 * target)
+        overflow_penalty = min(0.998, self._max_overflow_steps / self._cfg["max_steps"])
         overflow_score   = 1.0 - overflow_penalty
-
         score = 0.5 * wait_score + 0.5 * overflow_score
-        return round(score, 4)
+        return round(min(0.999, max(0.001, score)), 4)
 
     def _grade_hard(self) -> float:
-        """
-        Score on throughput achieved vs target, penalised by overflow duration.
-        """
         target_tp = self._cfg["target_throughput"]
-        throughput_score = min(1.0, self._total_throughput / target_tp)
-
-        # Penalty: fraction of max allowed overflow exceeded
+        throughput_score = self._total_throughput / target_tp
         max_allowed = self._cfg["max_overflow_steps"]
-        overflow_ratio   = min(1.0, self._max_overflow_steps / max(1, max_allowed))
-        overflow_penalty = overflow_ratio * 0.4   # up to 40% deduction
-
-        score = max(0.0, throughput_score - overflow_penalty)
-        return round(score, 4)
-
-    # ----------------------------------------------------------
-    # INTERNAL HELPERS
-    # ----------------------------------------------------------
+        overflow_ratio   = min(0.998, self._max_overflow_steps / max(1, max_allowed))
+        overflow_penalty = overflow_ratio * 0.4
+        score = throughput_score - overflow_penalty
+        return round(min(0.999, max(0.001, score)), 4)
 
     def _safe_signal(self, requested: int) -> int:
-        """Enforce minimum green time before allowing a switch."""
         if self._in_yellow:
             return self._signal
         if requested != self._signal and self._time_on_signal < self._cfg["min_green_time"]:
@@ -337,10 +259,9 @@ class TrafficEnvironment:
         return requested
 
     def _compute_raw_reward(self, throughput: int, total_wait: float) -> float:
-        total_queue  = sum(l.queue_length for l in self._lanes.values())
-        max_queue    = max(l.queue_length  for l in self._lanes.values())
-        switch_pen   = 1 if self._in_yellow else 0
-
+        total_queue = sum(l.queue_length for l in self._lanes.values())
+        max_queue   = max(l.queue_length  for l in self._lanes.values())
+        switch_pen  = 1 if self._in_yellow else 0
         return (
             -1.2 * total_wait
             - 1.0 * total_queue
@@ -350,15 +271,10 @@ class TrafficEnvironment:
         )
 
     def _normalise_reward(self, raw: float) -> float:
-        """
-        Map raw reward to [0, 1].
-        Worst case: all 4 lanes full, max wait, no throughput ≈ -70
-        Best case:  empty lanes, high throughput ≈ +8
-        """
         WORST = -70.0
         BEST  =   8.0
         clipped = max(WORST, min(BEST, raw))
-        return round((clipped - WORST) / (BEST - WORST), 4)
+        return round(min(0.999, max(0.001, (clipped - WORST) / (BEST - WORST))), 4)
 
     def _observe(self, reward, done) -> TrafficObservation:
         def lane_state(lane: _Lane) -> LaneState:
@@ -369,10 +285,10 @@ class TrafficEnvironment:
             )
 
         return TrafficObservation(
-            north         = lane_state(self._lanes.get("N", _Lane(10, 0))),
-            south         = lane_state(self._lanes.get("S", _Lane(10, 0))),
-            east          = lane_state(self._lanes.get("E", _Lane(10, 0))),
-            west          = lane_state(self._lanes.get("W", _Lane(10, 0))),
+            north            = lane_state(self._lanes.get("N", _Lane(10, 0))),
+            south            = lane_state(self._lanes.get("S", _Lane(10, 0))),
+            east             = lane_state(self._lanes.get("E", _Lane(10, 0))),
+            west             = lane_state(self._lanes.get("W", _Lane(10, 0))),
             current_signal   = self._signal,
             time_on_signal   = self._time_on_signal,
             in_yellow_phase  = self._in_yellow,
@@ -380,9 +296,9 @@ class TrafficEnvironment:
             max_steps        = self._cfg["max_steps"],
             task_id          = self._task_id,
             task_description = self._cfg["description"],
-            done    = done,
-            reward  = reward,
-            info    = {
+            done             = done,
+            reward           = reward,
+            info             = {
                 "total_throughput": self._total_throughput,
                 "cumulative_wait":  round(self._cumulative_wait, 2),
             },
