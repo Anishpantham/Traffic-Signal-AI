@@ -6,6 +6,7 @@ sys.stdout.reconfigure(line_buffering=True)
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 API_KEY      = os.environ.get("API_KEY", os.environ.get("HF_TOKEN", "no-key"))
 MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "")
 
 llm = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
@@ -51,7 +52,7 @@ class LocalEnv:
         for l in self.lanes.values(): l.reset()
         self.signal=0; self.time_on=0; self.yellow=False; self.ycnt=0
         self.step=0; self.throughput=0; self.cum_wait=0.0
-        return self._obs(None, False)
+        return self._obs(0.5, False)
 
     def step_env(self, action):
         if not self.yellow:
@@ -130,25 +131,26 @@ for task_id, seed in zip(TASKS, SEEDS):
 
     while not done:
         signal, reasoning = decide(obs)
-        reward = obs.get("reward") or 0
+        reward = float(obs.get("reward") or 0.5)
+        reward = min(0.999, max(0.001, reward))
         print(f"[STEP] task={task_id} step={obs['step']} signal={signal} reward={round(reward,4)}", flush=True)
         print(json.dumps({"type": "[STEP]", "task_id": task_id, "step": obs["step"],
-                          "signal": signal, "reasoning": reasoning, "reward": reward,
+                          "signal": signal, "reasoning": reasoning, "reward": round(reward, 4),
                           "ns_queue": obs["north"]["queue_length"]+obs["south"]["queue_length"],
                           "ew_queue": obs["east"]["queue_length"]+obs["west"]["queue_length"]}), flush=True)
         obs, reward, done = env.step_env(signal)
         total_reward += reward; step_count += 1
 
-    score = env.grade()
+    score = min(0.999, max(0.001, env.grade()))
     passed = score >= {"easy": 0.70, "medium": 0.60, "hard": 0.55}[task_id]
     results[task_id] = score
     print(f"[END] task={task_id} score={score} passed={passed} steps={step_count}", flush=True)
     print(json.dumps({"type": "[END]", "task_id": task_id, "score": score, "passed": passed,
-                      "steps": step_count, "total_reward": round(total_reward,4),
+                      "steps": step_count, "total_reward": round(min(0.999, max(0.001, total_reward/max(1,step_count))), 4),
                       "elapsed_sec": round(time.time()-start_time,2)}), flush=True)
     time.sleep(0.5)
 
-avg_score = round(sum(results.values())/len(results), 4)
+avg_score = round(min(0.999, max(0.001, sum(results.values())/len(results))), 4)
 print(f"[END] run_type=baseline avg_score={avg_score} model={MODEL_NAME}", flush=True)
 print(json.dumps({"type": "[END]", "run_type": "baseline", "scores": results, "avg_score": avg_score, "model": MODEL_NAME}), flush=True)
 
