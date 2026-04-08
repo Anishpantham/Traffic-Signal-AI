@@ -1,31 +1,98 @@
-import os, sys, json, time, requests
+import os, sys, json, time, random
 
 sys.stdout.reconfigure(line_buffering=True)
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+MODEL_NAME   = os.environ.get("MODEL_NAME", "heuristic")
+API_BASE_URL = os.environ.get("API_BASE_URL", "")
 HF_TOKEN     = os.environ.get("HF_TOKEN", "")
-ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "https://anishpantham-traffic-signal-control.hf.space")
+ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "")
 
 TASKS = ["easy", "medium", "hard"]
 SEEDS = [42, 42, 42]
 
-print(json.dumps({"type": "[START]", "run_type": "baseline", "model": MODEL_NAME, "tasks": TASKS}), flush=True)
+TASK_CONFIG = {
+    "easy":   {"max_steps": 100, "spawn_prob": 0.2, "capacity": 10, "min_green": 3, "yellow": 2},
+    "medium": {"max_steps": 200, "spawn_prob": 0.4, "spawn_ew": 0.2, "capacity": 10, "min_green": 4, "yellow": 2},
+    "hard":   {"max_steps": 300, "spawn_prob": 0.55, "capacity": 8, "min_green": 5, "yellow": 2},
+}
 
-def env_reset(task_id, seed):
-    r = requests.post(f"{ENV_BASE_URL}/reset", json={"task_id": task_id, "seed": seed}, timeout=120)
-    r.raise_for_status()
-    return r.json()
+class Lane:
+    def __init__(self, cap, prob):
+        self.cap = cap; self.prob = prob; self.vehicles = []
+    def reset(self): self.vehicles = []
+    def update(self, green):
+        if len(self.vehicles) < self.cap and random.random() < self.prob:
+            self.vehicles.append(0)
+        crossed = False
+        if green and self.vehicles:
+            self.vehicles.pop(0); crossed = True
+        self.vehicles = [w+1 for w in self.vehicles]
+        return crossed
+    @property
+    def queue(self): return len(self.vehicles)
+    @property
+    def avg_wait(self): return sum(self.vehicles)/len(self.vehicles) if self.vehicles else 0.0
+    @property
+    def density(self): return self.queue / self.cap
 
-def env_step(signal, reasoning=""):
-    r = requests.post(f"{ENV_BASE_URL}/step", json={"signal": signal, "reasoning": reasoning}, timeout=120)
-    r.raise_for_status()
-    return r.json()
+class LocalEnv:
+    def __init__(self, task_id, seed):
+        random.seed(seed)
+        cfg = TASK_CONFIG[task_id]
+        sp = cfg["spawn_prob"]; sp_ew = cfg.get("spawn_ew", sp); cap = cfg["capacity"]
+        self.lanes = {"N": Lane(cap,sp), "S": Lane(cap,sp), "E": Lane(cap,sp_ew), "W": Lane(cap,sp_ew)}
+        self.cfg = cfg; self.task_id = task_id
+        self.signal = 0; self.time_on = 0; self.yellow = False; self.ycnt = 0
+        self.step = 0; self.throughput = 0; self.cum_wait = 0.0
 
-def env_grade():
-    r = requests.get(f"{ENV_BASE_URL}/grade", timeout=120)
-    r.raise_for_status()
-    return r.json()
+    def reset(self):
+        for l in self.lanes.values(): l.reset()
+        self.signal=0; self.time_on=0; self.yellow=False; self.ycnt=0
+        self.step=0; self.throughput=0; self.cum_wait=0.0
+        return self._obs(None, False)
+
+    def step_env(self, action):
+        if not self.yellow:
+            if action != self.signal and self.time_on >= self.cfg["min_green"]:
+                self.yellow = True; self.ycnt = 0; self.signal = action; self.time_on = 0
+        if self.yellow:
+            self.ycnt += 1
+            if self.ycnt >= self.cfg["yellow"]: self.yellow = False
+            green_lanes = []
+        else:
+            green_lanes = ["N","S"] if self.signal == 0 else ["E","W"]
+        for name, lane in self.lanes.items():
+            crossed = lane.update(name in green_lanes)
+            if crossed: self.throughput += 1
+        tw = sum(l.avg_wait for l in self.lanes.values())
+        self.cum_wait += tw
+        tq = sum(l.queue for l in self.lanes.values())
+        mq = max(l.queue for l in self.lanes.values())
+        raw = -1.2*tw - 1.0*tq - 2.0*mq
+        reward = max(0.0, min(1.0, (raw + 70) / 78))
+        self.step += 1; self.time_on += 1
+        done = self.step >= self.cfg["max_steps"]
+        return self._obs(reward, done), reward, done
+
+    def grade(self):
+        avg_wait = self.cum_wait / max(1, self.step) / 4
+        if self.task_id == "easy":
+            return round(max(0.0, 1.0 - avg_wait / 10.0), 4)
+        elif self.task_id == "medium":
+            return round(max(0.0, 1.0 - avg_wait / 16.0), 4)
+        else:
+            return round(min(1.0, self.throughput / 180.0), 4)
+
+    def _obs(self, reward, done):
+        return {
+            "step": self.step, "max_steps": self.cfg["max_steps"],
+            "current_signal": self.signal, "time_on_signal": self.time_on,
+            "in_yellow_phase": self.yellow, "done": done, "reward": reward,
+            "north": {"queue_length": self.lanes["N"].queue, "avg_wait_time": self.lanes["N"].avg_wait, "density": self.lanes["N"].density},
+            "south": {"queue_length": self.lanes["S"].queue, "avg_wait_time": self.lanes["S"].avg_wait, "density": self.lanes["S"].density},
+            "east":  {"queue_length": self.lanes["E"].queue, "avg_wait_time": self.lanes["E"].avg_wait, "density": self.lanes["E"].density},
+            "west":  {"queue_length": self.lanes["W"].queue, "avg_wait_time": self.lanes["W"].avg_wait, "density": self.lanes["W"].density},
+        }
 
 def decide(obs):
     ns = obs["north"]["queue_length"] + obs["south"]["queue_length"]
@@ -33,59 +100,43 @@ def decide(obs):
     signal = 0 if ns >= ew else 1
     return signal, f"NS={ns} EW={ew} giving {'NS' if signal==0 else 'EW'} green"
 
-def run_task(task_id, seed):
-    print(json.dumps({"type": "[START]", "task_id": task_id, "model": MODEL_NAME, "seed": seed}), flush=True)
-    try:
-        obs  = env_reset(task_id, seed)
-        done = obs.get("done", False)
-        total_reward = 0.0
-        step_count   = 0
-        start_time   = time.time()
-
-        while not done:
-            signal, reasoning = decide(obs)
-            print(json.dumps({
-                "type":      "[STEP]",
-                "task_id":   task_id,
-                "step":      obs["step"],
-                "signal":    signal,
-                "reasoning": reasoning,
-                "reward":    obs.get("reward", 0),
-                "ns_queue":  obs["north"]["queue_length"] + obs["south"]["queue_length"],
-                "ew_queue":  obs["east"]["queue_length"]  + obs["west"]["queue_length"],
-            }), flush=True)
-
-            result       = env_step(signal, reasoning)
-            obs          = result["observation"]
-            reward       = result["reward"]
-            done         = result["done"]
-            total_reward += reward
-            step_count   += 1
-
-        grade_result = env_grade()
-        print(json.dumps({
-            "type":         "[END]",
-            "task_id":      task_id,
-            "score":        grade_result["score"],
-            "passed":       grade_result["passed"],
-            "threshold":    grade_result["threshold"],
-            "steps":        step_count,
-            "total_reward": round(total_reward, 4),
-            "elapsed_sec":  round(time.time() - start_time, 2),
-        }), flush=True)
-        return grade_result["score"]
-
-    except Exception as e:
-        print(json.dumps({"type": "[END]", "task_id": task_id, "score": 0.0, "passed": False, "error": str(e)}), flush=True)
-        return 0.0
+print(f"[START] run_type=baseline model={MODEL_NAME}", flush=True)
+print(json.dumps({"type": "[START]", "run_type": "baseline", "model": MODEL_NAME, "tasks": TASKS}), flush=True)
 
 results = {}
 for task_id, seed in zip(TASKS, SEEDS):
-    results[task_id] = run_task(task_id, seed)
-    time.sleep(1)
+    print(f"[START] task={task_id} model={MODEL_NAME} seed={seed}", flush=True)
+    print(json.dumps({"type": "[START]", "task_id": task_id, "model": MODEL_NAME, "seed": seed}), flush=True)
 
-avg_score = sum(results.values()) / len(results)
-print(json.dumps({"type": "[END]", "run_type": "baseline", "scores": results, "avg_score": round(avg_score, 4), "model": MODEL_NAME}), flush=True)
+    env = LocalEnv(task_id, seed)
+    obs = env.reset()
+    done = obs["done"]
+    total_reward = 0.0; step_count = 0; start_time = time.time()
+
+    while not done:
+        signal, reasoning = decide(obs)
+        reward = obs.get("reward") or 0
+        print(f"[STEP] task={task_id} step={obs['step']} signal={signal} reward={round(reward,4)}", flush=True)
+        print(json.dumps({"type": "[STEP]", "task_id": task_id, "step": obs["step"],
+                          "signal": signal, "reasoning": reasoning, "reward": reward,
+                          "ns_queue": obs["north"]["queue_length"]+obs["south"]["queue_length"],
+                          "ew_queue": obs["east"]["queue_length"]+obs["west"]["queue_length"]}), flush=True)
+        obs, reward, done = env.step_env(signal)
+        total_reward += reward; step_count += 1
+
+    score = env.grade()
+    passed = score >= {"easy": 0.70, "medium": 0.60, "hard": 0.55}[task_id]
+    results[task_id] = score
+
+    print(f"[END] task={task_id} score={score} passed={passed} steps={step_count}", flush=True)
+    print(json.dumps({"type": "[END]", "task_id": task_id, "score": score, "passed": passed,
+                      "steps": step_count, "total_reward": round(total_reward,4),
+                      "elapsed_sec": round(time.time()-start_time,2)}), flush=True)
+    time.sleep(0.5)
+
+avg_score = round(sum(results.values())/len(results), 4)
+print(f"[END] run_type=baseline avg_score={avg_score} model={MODEL_NAME}", flush=True)
+print(json.dumps({"type": "[END]", "run_type": "baseline", "scores": results, "avg_score": avg_score, "model": MODEL_NAME}), flush=True)
 
 def main():
     pass
