@@ -1,19 +1,21 @@
 import os, sys, json, time, random
+from openai import OpenAI
 
 sys.stdout.reconfigure(line_buffering=True)
 
-MODEL_NAME   = os.environ.get("MODEL_NAME", "heuristic")
-API_BASE_URL = os.environ.get("API_BASE_URL", "")
-HF_TOKEN     = os.environ.get("HF_TOKEN", "")
-ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "")
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
+API_KEY      = os.environ.get("API_KEY", os.environ.get("HF_TOKEN", "no-key"))
+MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+
+llm = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
 TASKS = ["easy", "medium", "hard"]
 SEEDS = [42, 42, 42]
 
 TASK_CONFIG = {
-    "easy":   {"max_steps": 100, "spawn_prob": 0.2, "capacity": 10, "min_green": 3, "yellow": 2},
-    "medium": {"max_steps": 200, "spawn_prob": 0.4, "spawn_ew": 0.2, "capacity": 10, "min_green": 4, "yellow": 2},
-    "hard":   {"max_steps": 300, "spawn_prob": 0.55, "capacity": 8, "min_green": 5, "yellow": 2},
+    "easy":   {"max_steps": 100, "spawn_prob": 0.2,  "capacity": 10, "min_green": 3, "yellow": 2},
+    "medium": {"max_steps": 200, "spawn_prob": 0.4,  "spawn_ew": 0.2, "capacity": 10, "min_green": 4, "yellow": 2},
+    "hard":   {"max_steps": 300, "spawn_prob": 0.55, "capacity": 8,  "min_green": 5, "yellow": 2},
 }
 
 class Lane:
@@ -54,7 +56,7 @@ class LocalEnv:
     def step_env(self, action):
         if not self.yellow:
             if action != self.signal and self.time_on >= self.cfg["min_green"]:
-                self.yellow = True; self.ycnt = 0; self.signal = action; self.time_on = 0
+                self.yellow=True; self.ycnt=0; self.signal=action; self.time_on=0
         if self.yellow:
             self.ycnt += 1
             if self.ycnt >= self.cfg["yellow"]: self.yellow = False
@@ -62,8 +64,7 @@ class LocalEnv:
         else:
             green_lanes = ["N","S"] if self.signal == 0 else ["E","W"]
         for name, lane in self.lanes.items():
-            crossed = lane.update(name in green_lanes)
-            if crossed: self.throughput += 1
+            lane.update(name in green_lanes)
         tw = sum(l.avg_wait for l in self.lanes.values())
         self.cum_wait += tw
         tq = sum(l.queue for l in self.lanes.values())
@@ -76,12 +77,9 @@ class LocalEnv:
 
     def grade(self):
         avg_wait = self.cum_wait / max(1, self.step) / 4
-        if self.task_id == "easy":
-            return round(max(0.0, 1.0 - avg_wait / 10.0), 4)
-        elif self.task_id == "medium":
-            return round(max(0.0, 1.0 - avg_wait / 16.0), 4)
-        else:
-            return round(min(1.0, self.throughput / 180.0), 4)
+        if self.task_id == "easy":     return round(max(0.0, 1.0 - avg_wait / 10.0), 4)
+        elif self.task_id == "medium": return round(max(0.0, 1.0 - avg_wait / 16.0), 4)
+        else:                          return round(min(1.0, self.throughput / 180.0), 4)
 
     def _obs(self, reward, done):
         return {
@@ -97,8 +95,21 @@ class LocalEnv:
 def decide(obs):
     ns = obs["north"]["queue_length"] + obs["south"]["queue_length"]
     ew = obs["east"]["queue_length"]  + obs["west"]["queue_length"]
-    signal = 0 if ns >= ew else 1
-    return signal, f"NS={ns} EW={ew} giving {'NS' if signal==0 else 'EW'} green"
+    try:
+        resp = llm.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "Traffic signal controller. Reply JSON only: {\"signal\": 0 or 1}. 0=NS green, 1=EW green."},
+                {"role": "user", "content": f"NS queue={ns}, EW queue={ew}, step={obs['step']}/{obs['max_steps']}. Choose signal."}
+            ],
+            max_tokens=20, temperature=0.0,
+        )
+        raw = resp.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
+        signal = max(0, min(1, int(json.loads(raw).get("signal", 0 if ns >= ew else 1))))
+        return signal, f"LLM: NS={ns} EW={ew} -> {'NS' if signal==0 else 'EW'}"
+    except Exception as e:
+        signal = 0 if ns >= ew else 1
+        return signal, f"heuristic: NS={ns} EW={ew}"
 
 print(f"[START] run_type=baseline model={MODEL_NAME}", flush=True)
 print(json.dumps({"type": "[START]", "run_type": "baseline", "model": MODEL_NAME, "tasks": TASKS}), flush=True)
@@ -127,7 +138,6 @@ for task_id, seed in zip(TASKS, SEEDS):
     score = env.grade()
     passed = score >= {"easy": 0.70, "medium": 0.60, "hard": 0.55}[task_id]
     results[task_id] = score
-
     print(f"[END] task={task_id} score={score} passed={passed} steps={step_count}", flush=True)
     print(json.dumps({"type": "[END]", "task_id": task_id, "score": score, "passed": passed,
                       "steps": step_count, "total_reward": round(total_reward,4),
