@@ -64,22 +64,26 @@ class LocalEnv:
         else:
             green_lanes = ["N","S"] if self.signal == 0 else ["E","W"]
         for name, lane in self.lanes.items():
-            lane.update(name in green_lanes)
+            crossed = lane.update(name in green_lanes)
+            if crossed: self.throughput += 1
         tw = sum(l.avg_wait for l in self.lanes.values())
         self.cum_wait += tw
         tq = sum(l.queue for l in self.lanes.values())
         mq = max(l.queue for l in self.lanes.values())
         raw = -1.2*tw - 1.0*tq - 2.0*mq
-        reward = max(0.0, min(1.0, (raw + 70) / 78))
+        reward = max(0.001, min(0.999, (raw + 70) / 78))
         self.step += 1; self.time_on += 1
         done = self.step >= self.cfg["max_steps"]
         return self._obs(reward, done), reward, done
 
     def grade(self):
         avg_wait = self.cum_wait / max(1, self.step) / 4
-        if self.task_id == "easy":     return round(max(0.0, 1.0 - avg_wait / 10.0), 4)
-        elif self.task_id == "medium": return round(max(0.0, 1.0 - avg_wait / 16.0), 4)
-        else:                          return round(min(1.0, self.throughput / 180.0), 4)
+        if self.task_id == "easy":
+            return round(min(0.999, max(0.001, 1.0 - avg_wait / 10.0)), 4)
+        elif self.task_id == "medium":
+            return round(min(0.999, max(0.001, 1.0 - avg_wait / 16.0)), 4)
+        else:
+            return round(min(0.999, max(0.001, self.throughput / 180.0)), 4)
 
     def _obs(self, reward, done):
         return {
