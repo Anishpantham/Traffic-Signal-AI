@@ -1,0 +1,116 @@
+name: traffic-signal-control
+version: "1.0.0"
+description: >
+  A real-world traffic signal control environment where an LLM agent manages
+  a 4-way intersection by deciding which direction (North/South or East/West)
+  gets the green light at each timestep. The agent must minimise vehicle wait
+  times and prevent lane overflow under increasingly challenging traffic conditions.
+
+tags:
+  - openenv
+  - traffic
+  - real-world
+  - signal-control
+  - infrastructure
+
+author: "traffic-signal-team"
+license: MIT
+
+# ── Interface ───────────────────────────────────────────────
+interface:
+  action:
+    type: object
+    description: "Signal phase decision"
+    properties:
+      signal:
+        type: integer
+        enum: [0, 1]
+        description: "0 = North/South green, 1 = East/West green"
+      reasoning:
+        type: string
+        description: "Optional agent reasoning (logged but not used in simulation)"
+
+  observation:
+    type: object
+    description: "Full intersection state"
+    properties:
+      north:        { $ref: "#/components/LaneState" }
+      south:        { $ref: "#/components/LaneState" }
+      east:         { $ref: "#/components/LaneState" }
+      west:         { $ref: "#/components/LaneState" }
+      current_signal:   { type: integer }
+      time_on_signal:   { type: integer }
+      in_yellow_phase:  { type: boolean }
+      step:             { type: integer }
+      max_steps:        { type: integer }
+      task_id:          { type: string  }
+      task_description: { type: string  }
+      done:             { type: boolean }
+      reward:           { type: number, minimum: 0.0, maximum: 1.0 }
+
+  state:
+    type: object
+    description: "Episode metadata"
+    properties:
+      episode_id:   { type: string  }
+      step_count:   { type: integer }
+      task_id:      { type: string  }
+      total_reward: { type: number  }
+      is_done:      { type: boolean }
+
+components:
+  LaneState:
+    type: object
+    properties:
+      queue_length:   { type: integer }
+      avg_wait_time:  { type: number  }
+      density:        { type: number, minimum: 0.0, maximum: 1.0 }
+
+# ── Tasks ───────────────────────────────────────────────────
+tasks:
+  - id: easy
+    difficulty: easy
+    max_steps: 100
+    description: >
+      Low-traffic intersection. Keep average wait time below 5 steps
+      across all lanes over 100 simulation steps.
+    success_threshold: 0.70
+    reward_range: [0.0, 1.0]
+
+  - id: medium
+    difficulty: medium
+    max_steps: 200
+    description: >
+      High-traffic intersection with unbalanced flow (NS twice as busy as EW).
+      Minimise total queue and prevent overflow over 200 steps.
+    success_threshold: 0.60
+    reward_range: [0.0, 1.0]
+
+  - id: hard
+    difficulty: hard
+    max_steps: 300
+    description: >
+      Rush-hour surge with constrained lane capacity. Achieve target throughput
+      without sustained overflow over 300 steps.
+    success_threshold: 0.55
+    reward_range: [0.0, 1.0]
+
+# ── Server ──────────────────────────────────────────────────
+server:
+  port: 7860
+  framework: fastapi
+  endpoints:
+    - POST /reset
+    - POST /step
+    - GET  /state
+    - GET  /grade
+    - GET  /health
+    - GET  /tasks
+    - GET  /schema
+
+# ── Infra ───────────────────────────────────────────────────
+infra:
+  min_vcpu: 2
+  min_memory_gb: 2
+  max_runtime_minutes: 20
+  containerized: true
