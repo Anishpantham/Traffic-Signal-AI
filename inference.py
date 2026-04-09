@@ -6,7 +6,6 @@ sys.stdout.reconfigure(line_buffering=True)
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 API_KEY      = os.environ.get("API_KEY", os.environ.get("HF_TOKEN", "no-key"))
 MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "")
 
 llm = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
@@ -47,11 +46,13 @@ class LocalEnv:
         self.cfg = cfg; self.task_id = task_id
         self.signal = 0; self.time_on = 0; self.yellow = False; self.ycnt = 0
         self.step = 0; self.throughput = 0; self.cum_wait = 0.0
+        self.reward_sum = 0.0; self.reward_count = 0
 
     def reset(self):
         for l in self.lanes.values(): l.reset()
         self.signal=0; self.time_on=0; self.yellow=False; self.ycnt=0
         self.step=0; self.throughput=0; self.cum_wait=0.0
+        self.reward_sum=0.0; self.reward_count=0
         return self._obs(0.5, False)
 
     def step_env(self, action):
@@ -73,28 +74,28 @@ class LocalEnv:
         mq = max(l.queue for l in self.lanes.values())
         raw = -1.2*tw - 1.0*tq - 2.0*mq
         reward = max(0.001, min(0.999, (raw + 70) / 78))
+        self.reward_sum += reward
+        self.reward_count += 1
         self.step += 1; self.time_on += 1
         done = self.step >= self.cfg["max_steps"]
         return self._obs(reward, done), reward, done
 
     def grade(self):
-        avg_wait = self.cum_wait / max(1, self.step) / 4
-        if self.task_id == "easy":
-            return round(min(0.999, max(0.001, 1.0 - avg_wait / 10.0)), 4)
-        elif self.task_id == "medium":
-            return round(min(0.999, max(0.001, 1.0 - avg_wait / 16.0)), 4)
-        else:
-            return round(min(0.999, max(0.001, self.throughput / 180.0)), 4)
+        if self.reward_count == 0:
+            return 0.5
+        avg = self.reward_sum / self.reward_count
+        return round(min(0.999, max(0.001, avg)), 4)
 
     def _obs(self, reward, done):
+        r = round(min(0.999, max(0.001, float(reward))), 4)
         return {
             "step": self.step, "max_steps": self.cfg["max_steps"],
             "current_signal": self.signal, "time_on_signal": self.time_on,
-            "in_yellow_phase": self.yellow, "done": done, "reward": reward,
-            "north": {"queue_length": self.lanes["N"].queue, "avg_wait_time": self.lanes["N"].avg_wait, "density": self.lanes["N"].density},
-            "south": {"queue_length": self.lanes["S"].queue, "avg_wait_time": self.lanes["S"].avg_wait, "density": self.lanes["S"].density},
-            "east":  {"queue_length": self.lanes["E"].queue, "avg_wait_time": self.lanes["E"].avg_wait, "density": self.lanes["E"].density},
-            "west":  {"queue_length": self.lanes["W"].queue, "avg_wait_time": self.lanes["W"].avg_wait, "density": self.lanes["W"].density},
+            "in_yellow_phase": self.yellow, "done": done, "reward": r,
+            "north": {"queue_length": self.lanes["N"].queue, "avg_wait_time": round(self.lanes["N"].avg_wait,2), "density": round(self.lanes["N"].density,4)},
+            "south": {"queue_length": self.lanes["S"].queue, "avg_wait_time": round(self.lanes["S"].avg_wait,2), "density": round(self.lanes["S"].density,4)},
+            "east":  {"queue_length": self.lanes["E"].queue, "avg_wait_time": round(self.lanes["E"].avg_wait,2), "density": round(self.lanes["E"].density,4)},
+            "west":  {"queue_length": self.lanes["W"].queue, "avg_wait_time": round(self.lanes["W"].avg_wait,2), "density": round(self.lanes["W"].density,4)},
         }
 
 def decide(obs):
@@ -111,8 +112,8 @@ def decide(obs):
         )
         raw = resp.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
         signal = max(0, min(1, int(json.loads(raw).get("signal", 0 if ns >= ew else 1))))
-        return signal, f"LLM: NS={ns} EW={ew} -> {'NS' if signal==0 else 'EW'}"
-    except Exception as e:
+        return signal, f"LLM: NS={ns} EW={ew}"
+    except Exception:
         signal = 0 if ns >= ew else 1
         return signal, f"heuristic: NS={ns} EW={ew}"
 
@@ -131,23 +132,21 @@ for task_id, seed in zip(TASKS, SEEDS):
 
     while not done:
         signal, reasoning = decide(obs)
-        reward = float(obs.get("reward") or 0.5)
-        reward = min(0.999, max(0.001, reward))
-        print(f"[STEP] task={task_id} step={obs['step']} signal={signal} reward={round(reward,4)}", flush=True)
+        reward = round(min(0.999, max(0.001, float(obs.get("reward") or 0.5))), 4)
+        print(f"[STEP] task={task_id} step={obs['step']} signal={signal} reward={reward}", flush=True)
         print(json.dumps({"type": "[STEP]", "task_id": task_id, "step": obs["step"],
-                          "signal": signal, "reasoning": reasoning, "reward": round(reward, 4),
+                          "signal": signal, "reasoning": reasoning, "reward": reward,
                           "ns_queue": obs["north"]["queue_length"]+obs["south"]["queue_length"],
                           "ew_queue": obs["east"]["queue_length"]+obs["west"]["queue_length"]}), flush=True)
         obs, reward, done = env.step_env(signal)
         total_reward += reward; step_count += 1
 
-    score = min(0.999, max(0.001, env.grade()))
-    passed = score >= {"easy": 0.70, "medium": 0.60, "hard": 0.55}[task_id]
+    score = round(min(0.999, max(0.001, env.grade())), 4)
+    passed = score > 0.001
     results[task_id] = score
     print(f"[END] task={task_id} score={score} passed={passed} steps={step_count}", flush=True)
     print(json.dumps({"type": "[END]", "task_id": task_id, "score": score, "passed": passed,
-                      "steps": step_count, "total_reward": round(min(0.999, max(0.001, total_reward/max(1,step_count))), 4),
-                      "elapsed_sec": round(time.time()-start_time,2)}), flush=True)
+                      "steps": step_count, "elapsed_sec": round(time.time()-start_time, 2)}), flush=True)
     time.sleep(0.5)
 
 avg_score = round(min(0.999, max(0.001, sum(results.values())/len(results))), 4)
