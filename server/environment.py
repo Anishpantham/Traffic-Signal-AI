@@ -149,7 +149,7 @@ class TrafficEnvironment:
             "W": _Lane(cap, sp_ew),
         }
 
-        return self._observe(reward=None, done=False)
+        return self._observe(reward=0.5, done=False)
 
     def step(self, action: TrafficAction) -> Tuple[TrafficObservation, float, bool]:
         if self._done:
@@ -297,7 +297,7 @@ class TrafficEnvironment:
             task_id          = self._task_id,
             task_description = self._cfg["description"],
             done             = done,
-            reward           = reward,
+            reward           = round(min(0.999, max(0.001, float(reward))), 4),
             info             = {
                 "total_throughput": self._total_throughput,
                 "cumulative_wait":  round(self._cumulative_wait, 2),
